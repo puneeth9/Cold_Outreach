@@ -3,25 +3,30 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from src.core.outreach_service import OutreachData
-from src.models import Outreach, OutreachStatus
+from src.models import Outreach
 
 
 def save_outreach(session: Session, data: OutreachData) -> Outreach:
-    now = datetime.now(timezone.utc)
     record = Outreach(
         recipient_email=data.recipient_email,
         recipient_name=data.recipient_name,
         company=data.company,
-        role_context=data.role_context,
-        subject=data.subject,
-        body=data.body,
-        sent_at=data.sent_at,
-        created_at=now,
-        status=data.status,
+        role=data.role,
+        follow_up_after_days=data.follow_up_after_days,
+        archived=data.archived,
+        created_at=datetime.now(timezone.utc),
     )
     session.add(record)
-    session.flush()  # populate id before caller returns
+    session.flush()
     return record
+
+
+def get_outreach_by_id(session: Session, outreach_id: int) -> Outreach | None:
+    return session.query(Outreach).filter(Outreach.id == outreach_id).first()
+
+
+def list_outreaches(session: Session) -> list[Outreach]:
+    return session.query(Outreach).order_by(Outreach.created_at.desc()).all()
 
 
 def update_outreach(session: Session, outreach_id: int, **fields) -> Outreach | None:
@@ -35,8 +40,25 @@ def update_outreach(session: Session, outreach_id: int, **fields) -> Outreach | 
     return record
 
 
-def list_outreach(session: Session, status_filter: str | None = None) -> list[Outreach]:
-    query = session.query(Outreach)
-    if status_filter is not None:
-        query = query.filter(Outreach.status == OutreachStatus(status_filter))
-    return query.order_by(Outreach.sent_at.desc()).all()
+def set_thread_id(session: Session, outreach_id: int, thread_id: str) -> None:
+    session.query(Outreach).filter(Outreach.id == outreach_id).update(
+        {"gmail_thread_id": thread_id}
+    )
+
+
+def get_unresolved_outreaches(session: Session) -> list[Outreach]:
+    """Return non-archived outreaches that don't have a Gmail thread ID yet."""
+    return (
+        session.query(Outreach)
+        .filter(Outreach.archived.is_(False), Outreach.gmail_thread_id.is_(None))
+        .all()
+    )
+
+
+def get_active_outreaches(session: Session) -> list[Outreach]:
+    """Return all non-archived outreaches that have a resolved Gmail thread ID."""
+    return (
+        session.query(Outreach)
+        .filter(Outreach.archived.is_(False), Outreach.gmail_thread_id.isnot(None))
+        .all()
+    )

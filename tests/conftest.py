@@ -3,8 +3,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.models.base import Base
-import src.models.outreach  # noqa: F401 — register models with metadata
-import src.models.reply     # noqa: F401
+import src.models.outreach  # noqa: F401
+import src.models.message   # noqa: F401
 
 
 @pytest.fixture

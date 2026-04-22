@@ -11,7 +11,6 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 
 def _as_utc(dt: datetime) -> datetime:
-    """Ensure a datetime is UTC-aware. SQLite returns naive datetimes stored as UTC."""
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -21,31 +20,40 @@ class GmailClient:
     def __init__(self) -> None:
         creds = Credentials.from_authorized_user_file(settings.google_credentials_file, SCOPES)
         self._service = build("gmail", "v1", credentials=creds)
+        self._authenticated_email: str | None = None
 
-    def list_message_ids_from(self, sender_email: str, after: datetime) -> list[str]:
-        """Return all message IDs of emails from sender_email received after `after`."""
-        utc_after = _as_utc(after)
-        # Gmail search requires YYYY/MM/DD format for after: operator
-        date_str = utc_after.strftime("%Y/%m/%d")
-        query = f"from:{sender_email} after:{date_str}"
+    def get_authenticated_email(self) -> str:
+        """Return the Gmail address of the authenticated user (cached after first call)."""
+        if self._authenticated_email is None:
+            profile = self._service.users().getProfile(userId="me").execute()
+            self._authenticated_email = profile["emailAddress"].lower()
+        return self._authenticated_email
 
-        message_ids = []
-        page_token = None
+    # --- Thread-based methods ---
 
-        while True:
-            kwargs = {"userId": "me", "q": query}
-            if page_token:
-                kwargs["pageToken"] = page_token
+    def search_sent_thread_id(self, to_email: str, subject: str) -> str | None:
+        """Search Gmail sent mail for a thread matching to_email + exact subject.
 
-            result = self._service.users().messages().list(**kwargs).execute()
-            messages = result.get("messages", [])
-            message_ids.extend(m["id"] for m in messages)
+        Returns the threadId of the most recent match, or None if not found.
+        """
+        query = f'to:{to_email} subject:"{subject}" in:sent'
+        result = self._service.users().messages().list(userId="me", q=query).execute()
+        messages = result.get("messages", [])
+        if not messages:
+            return None
+        # Gmail returns most recent first; take the first match.
+        msg = self._service.users().messages().get(
+            userId="me", id=messages[0]["id"], format="minimal"
+        ).execute()
+        return msg.get("threadId")
 
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
-
-        return message_ids
+    def get_thread_message_ids(self, thread_id: str) -> list[str]:
+        """Return message IDs in the thread, ordered by internalDate ascending."""
+        thread = self._service.users().threads().get(
+            userId="me", id=thread_id, format="minimal"
+        ).execute()
+        messages = thread.get("messages", [])
+        return [m["id"] for m in messages]
 
     def get_message(self, message_id: str) -> dict:
         return (
@@ -54,6 +62,8 @@ class GmailClient:
             .get(userId="me", id=message_id, format="full")
             .execute()
         )
+
+    # --- Message parsing helpers ---
 
     def get_from_email(self, message: dict) -> str | None:
         headers = message.get("payload", {}).get("headers", [])
@@ -65,7 +75,14 @@ class GmailClient:
                 return raw.strip().lower()
         return None
 
-    def get_received_at(self, message: dict) -> datetime:
+    def get_subject(self, message: dict) -> str:
+        headers = message.get("payload", {}).get("headers", [])
+        for h in headers:
+            if h["name"].lower() == "subject":
+                return h["value"].strip()
+        return "(no subject)"
+
+    def get_sent_at(self, message: dict) -> datetime:
         ts_ms = int(message.get("internalDate", 0))
         return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
 

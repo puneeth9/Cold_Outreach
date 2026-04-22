@@ -23,7 +23,6 @@ class ClaudeClient:
             messages=[{"role": "user", "content": prompt}],
         )
 
-        # tool_choice forces exactly one tool use block
         tool_block = next(
             (b for b in response.content if b.type == "tool_use"),
             None,

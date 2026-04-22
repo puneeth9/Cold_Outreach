@@ -7,11 +7,14 @@ class Settings(BaseSettings):
     # Stage 1
     database_url: str = "sqlite:///./outreach.db"
 
-    # Stage 2 — Gmail OAuth
-    google_client_secret_file: str = "client_secret.json"  # downloaded from GCP Console
-    google_credentials_file: str = "token.json"            # written by `auth` command
+    # v1.5 — thread-based follow-up threshold
+    follow_up_after_days_default: int = 5
 
-    # Stage 2 — Pub/Sub
+    # Stage 2 — Gmail OAuth
+    google_client_secret_file: str = "client_secret.json"
+    google_credentials_file: str = "token.json"
+
+    # Stage 2 — Pub/Sub (future)
     pubsub_subscription_name: str | None = None
     pubsub_push_token: str | None = None
 

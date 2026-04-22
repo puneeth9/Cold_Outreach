@@ -9,14 +9,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Import all models so autogenerate can see them
 from src.models.base import Base
 import src.models.outreach  # noqa: F401
-import src.models.reply     # noqa: F401
+import src.models.message   # noqa: F401
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url from settings so it stays .env-driven
 from src.config import settings
 config.set_main_option("sqlalchemy.url", settings.database_url)
 

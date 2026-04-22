@@ -1,8 +1,9 @@
-import pytest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.core.classifier import ClassificationResult
-from src.models.reply import Classification
+from src.models.message import Classification
 
 
 @pytest.fixture

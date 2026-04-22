@@ -8,106 +8,185 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.config import settings
+from src.core.message_service import build_message
 from src.core.outreach_service import build_outreach
-from src.db.outreach_repo import list_outreach, save_outreach, update_outreach
-from src.db.reply_repo import (
-    get_awaiting_outreaches,
+from src.core.status import compute_status
+from src.db.message_repo import (
+    get_local_gmail_ids,
+    get_message_by_id,
+    get_messages_for_outreach,
+    save_message,
+    update_message_classification,
+)
+from src.db.outreach_repo import (
+    get_active_outreaches,
     get_outreach_by_id,
-    get_replies_for_outreach,
-    get_reply_by_id,
-    mark_outreach_replied,
-    save_reply,
-    update_reply_classification,
+    get_unresolved_outreaches,
+    list_outreaches,
+    save_outreach,
+    set_thread_id,
+    update_outreach,
 )
 from src.db.session import get_session
+from src.models.message import Direction
 
 app = typer.Typer(help="Cold outreach tracker")
 console = Console()
 
 
 def _fmt(dt: datetime) -> str:
-    """Format a UTC datetime as local time."""
     local = dt.replace(tzinfo=timezone.utc).astimezone(tz=None)
     return local.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _status_color(status: str) -> str:
+    colors = {
+        "interested": "green",
+        "not_interested": "red",
+        "needs_followup": "yellow",
+        "follow_up_needed": "magenta",
+        "awaiting_reply": "cyan",
+        "unclassified": "dim",
+        "archived": "dim",
+        "draft": "dim",
+    }
+    color = colors.get(status, "white")
+    return f"[{color}]{status}[/{color}]"
+
+
+def _read_body(body_file: Optional[Path]) -> str:
+    if body_file:
+        return body_file.read_text()
+    console.print("Paste email body. Enter [bold]EOF[/bold] on a new line to finish:")
+    lines = []
+    while True:
+        line = input()
+        if line == "EOF":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _classify_message(session, message, outreach) -> None:
+    from src.core.classifier import build_prompt
+    from src.integrations.claude_client import ClaudeClient
+
+    try:
+        messages = get_messages_for_outreach(session, outreach.id)
+        # Build thread up to and including this message
+        thread = [m for m in messages if m.sent_at <= message.sent_at]
+        if not thread or thread[-1].id != message.id:
+            thread.append(message)
+
+        claude = ClaudeClient()
+        prompt = build_prompt(
+            messages=thread,
+            recipient_name=outreach.recipient_name,
+            company=outreach.company,
+        )
+        result = claude.classify(prompt)
+        update_message_classification(session, message.id, result)
+        console.print(
+            f"    [cyan]Classified:[/cyan] {result.classification.value} "
+            f"({result.confidence:.0%}) — {result.reasoning}"
+        )
+    except Exception as e:
+        console.print(f"    [yellow]Classification failed:[/yellow] {e}")
 
 
 @app.command()
 def add(
     to: str = typer.Option(..., "--to", help="Recipient email address"),
-    name: str = typer.Option(..., "--name", help="Recipient name"),
     subject: str = typer.Option(..., "--subject", help="Email subject"),
+    name: Optional[str] = typer.Option(None, "--name", help="Recipient name"),
     company: Optional[str] = typer.Option(None, "--company", help="Recipient company"),
     role: Optional[str] = typer.Option(None, "--role", help="Role context (freeform)"),
     body_file: Optional[Path] = typer.Option(None, "--body-file", exists=True, help="Path to file containing email body"),
-    sent_at: Optional[str] = typer.Option(None, "--sent-at", help="ISO datetime of when email was sent (defaults to now)"),
+    sent_at: Optional[str] = typer.Option(None, "--sent-at", help="ISO datetime sent (defaults to now)"),
+    follow_up_after_days: Optional[int] = typer.Option(None, "--follow-up-after-days", help="Override global follow-up threshold"),
 ) -> None:
-    """Record a sent cold outreach email."""
-    if body_file:
-        body = body_file.read_text()
-    else:
-        console.print("Paste email body. Enter a blank line then [bold]EOF[/bold] to finish:")
-        lines = []
-        while True:
-            line = input()
-            if line == "EOF":
-                break
-            lines.append(line)
-        body = "\n".join(lines)
+    """Record a sent cold outreach email (creates outreach + first outbound message)."""
+    body = _read_body(body_file)
 
-    parsed_sent_at = None
-    if sent_at:
-        parsed_sent_at = datetime.fromisoformat(sent_at)
+    parsed_sent_at = datetime.fromisoformat(sent_at) if sent_at else datetime.now(timezone.utc)
 
     try:
-        data = build_outreach(
+        outreach_data = build_outreach(
             recipient_email=to,
             recipient_name=name,
-            subject=subject,
-            body=body,
             company=company,
-            role_context=role,
-            sent_at=parsed_sent_at,
+            role=role,
+            follow_up_after_days=follow_up_after_days,
         )
     except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
     with get_session() as session:
-        record = save_outreach(session, data)
-        console.print(f"[green]Added outreach #{record.id}[/green] to {data.recipient_email}")
+        outreach = save_outreach(session, outreach_data)
+        msg_data = build_message(
+            outreach_id=outreach.id,
+            direction=Direction.outbound,
+            subject=subject,
+            body=body,
+            sent_at=parsed_sent_at,
+        )
+        save_message(session, msg_data)
+        console.print(
+            f"[green]Added outreach #{outreach.id}[/green] to {outreach_data.recipient_email}\n"
+            f"  Run [bold]outreach-track sync[/bold] to resolve the Gmail thread."
+        )
 
 
 @app.command(name="list")
 def list_cmd(
-    status: Optional[str] = typer.Option(None, "--status", help="Filter by status: awaiting_reply | replied | archived"),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by status"),
 ) -> None:
-    """List recorded outreach emails."""
-    valid_statuses = {"awaiting_reply", "replied", "archived"}
+    """List outreach records with their derived status."""
+    valid_statuses = {
+        "awaiting_reply", "follow_up_needed", "interested",
+        "not_interested", "needs_followup", "unclassified", "archived", "draft",
+    }
     if status and status not in valid_statuses:
         console.print(f"[red]Invalid status.[/red] Choose from: {', '.join(sorted(valid_statuses))}")
         raise typer.Exit(1)
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", justify="right", width=5)
-    table.add_column("Recipient", min_width=20)
-    table.add_column("Company", min_width=15)
-    table.add_column("Subject", min_width=25)
-    table.add_column("Status", min_width=15)
-    table.add_column("Sent At", min_width=20)
+    table.add_column("Recipient", min_width=22)
+    table.add_column("Company", min_width=14)
+    table.add_column("Status", min_width=18)
+    table.add_column("Thread ID", min_width=12)
+    table.add_column("Created", min_width=18)
 
+    # Status is computed in-memory after fetch (fine for local scale;
+    # future optimization: push status computation to SQL for large datasets)
     with get_session() as session:
-        records = list_outreach(session, status_filter=status)
-        if not records:
+        outreaches = list_outreaches(session)
+        if not outreaches:
             console.print("No outreach records found.")
             return
-        for r in records:
+
+        rows = []
+        for o in outreaches:
+            messages = get_messages_for_outreach(session, o.id)
+            derived = compute_status(o, messages, settings.follow_up_after_days_default)
+            if status and derived != status:
+                continue
+            rows.append((o, derived))
+
+        if not rows:
+            console.print(f"No outreaches with status '{status}'.")
+            return
+
+        for o, derived in rows:
             table.add_row(
-                str(r.id),
-                f"{r.recipient_name} <{r.recipient_email}>",
-                r.company or "—",
-                r.subject,
-                r.status.value,
-                _fmt(r.sent_at) if r.sent_at else "—",
+                str(o.id),
+                f"{o.recipient_name or '—'} <{o.recipient_email}>",
+                o.company or "—",
+                _status_color(derived),
+                o.gmail_thread_id[:12] + "…" if o.gmail_thread_id else "[dim]unresolved[/dim]",
+                _fmt(o.created_at) if o.created_at else "—",
             )
 
     console.print(table)
@@ -115,46 +194,49 @@ def list_cmd(
 
 @app.command()
 def show(outreach_id: int = typer.Argument(..., help="Outreach record ID")) -> None:
-    """Show full detail for a single outreach record and its replies."""
+    """Show full detail for an outreach including the complete message thread."""
     with get_session() as session:
-        record = get_outreach_by_id(session, outreach_id)
-        if not record:
+        outreach = get_outreach_by_id(session, outreach_id)
+        if not outreach:
             console.print(f"[red]No outreach found with ID {outreach_id}.[/red]")
             raise typer.Exit(1)
 
+        messages = get_messages_for_outreach(session, outreach_id)
+        derived = compute_status(outreach, messages, settings.follow_up_after_days_default)
+
         console.print(Panel(
-            f"[bold]To:[/bold] {record.recipient_name} <{record.recipient_email}>\n"
-            f"[bold]Company:[/bold] {record.company or '—'}\n"
-            f"[bold]Role:[/bold] {record.role_context or '—'}\n"
-            f"[bold]Subject:[/bold] {record.subject}\n"
-            f"[bold]Status:[/bold] {record.status.value}\n"
-            f"[bold]Sent:[/bold] {_fmt(record.sent_at)}\n\n"
-            f"[bold]Body:[/bold]\n{record.body}",
-            title=f"Outreach #{record.id}",
+            f"[bold]To:[/bold] {outreach.recipient_name or '—'} <{outreach.recipient_email}>\n"
+            f"[bold]Company:[/bold] {outreach.company or '—'}\n"
+            f"[bold]Role:[/bold] {outreach.role or '—'}\n"
+            f"[bold]Status:[/bold] {_status_color(derived)}\n"
+            f"[bold]Gmail Thread:[/bold] {outreach.gmail_thread_id or '[dim]unresolved — run sync[/dim]'}\n"
+            f"[bold]Follow-up after:[/bold] {outreach.follow_up_after_days or settings.follow_up_after_days_default} days\n"
+            f"[bold]Created:[/bold] {_fmt(outreach.created_at)}",
+            title=f"Outreach #{outreach.id}",
         ))
 
-        replies = get_replies_for_outreach(session, outreach_id)
-        if not replies:
-            console.print("[dim]No replies recorded.[/dim]")
+        if not messages:
+            console.print("[dim]No messages in thread.[/dim]")
             return
 
-        rtable = Table(show_header=True, header_style="bold", title="Replies")
-        rtable.add_column("Reply ID", justify="right", width=8)
-        rtable.add_column("Received", min_width=18)
-        rtable.add_column("Classification", min_width=15)
-        rtable.add_column("Confidence", justify="right", width=10)
-        rtable.add_column("Reasoning", min_width=30)
+        console.print(f"\n[bold]Thread ({len(messages)} message(s)):[/bold]\n")
+        for msg in messages:
+            if msg.direction == Direction.outbound:
+                arrow = "[blue]→ You[/blue]"
+            else:
+                arrow = "[green]← Recipient[/green]"
 
-        for r in replies:
-            rtable.add_row(
-                str(r.id),
-                _fmt(r.received_at),
-                r.classification.value,
-                f"{r.classification_confidence:.0%}" if r.classification_confidence else "—",
-                r.classification_reasoning or "—",
-            )
+            header = f"{arrow}  [dim]{_fmt(msg.sent_at)}[/dim]  Subject: {msg.subject}"
+            console.print(header)
+            console.print(f"   ID: {msg.id}")
+            console.print(f"   {msg.body.strip()[:300]}{'…' if len(msg.body) > 300 else ''}")
 
-        console.print(rtable)
+            if msg.direction == Direction.inbound and msg.classification:
+                console.print(
+                    f"   [cyan]Classification:[/cyan] {msg.classification.value} "
+                    f"({msg.classification_confidence:.0%} confidence) — {msg.classification_reasoning}"
+                )
+            console.print()
 
 
 @app.command()
@@ -162,35 +244,25 @@ def edit(
     outreach_id: int = typer.Argument(..., help="Outreach record ID to edit"),
     to: Optional[str] = typer.Option(None, "--to", help="New recipient email"),
     name: Optional[str] = typer.Option(None, "--name", help="New recipient name"),
-    subject: Optional[str] = typer.Option(None, "--subject", help="New subject"),
     company: Optional[str] = typer.Option(None, "--company", help="New company"),
     role: Optional[str] = typer.Option(None, "--role", help="New role context"),
-    status: Optional[str] = typer.Option(None, "--status", help="New status: awaiting_reply | replied | archived"),
-    sent_at: Optional[str] = typer.Option(None, "--sent-at", help="New sent datetime (ISO format)"),
+    follow_up_after_days: Optional[int] = typer.Option(None, "--follow-up-after-days", help="New follow-up threshold (days)"),
+    archived: Optional[bool] = typer.Option(None, "--archived", help="Set archived status (true/false)"),
 ) -> None:
     """Edit fields on an existing outreach record."""
-    from src.models.outreach import OutreachStatus
-
-    valid_statuses = {"awaiting_reply", "replied", "archived"}
-    if status and status not in valid_statuses:
-        console.print(f"[red]Invalid status.[/red] Choose from: {', '.join(sorted(valid_statuses))}")
-        raise typer.Exit(1)
-
     fields = {}
     if to:
         fields["recipient_email"] = to.strip().lower()
     if name:
         fields["recipient_name"] = name.strip()
-    if subject:
-        fields["subject"] = subject.strip()
     if company:
         fields["company"] = company.strip()
     if role:
-        fields["role_context"] = role.strip()
-    if status:
-        fields["status"] = OutreachStatus(status)
-    if sent_at:
-        fields["sent_at"] = datetime.fromisoformat(sent_at)
+        fields["role"] = role.strip()
+    if follow_up_after_days is not None:
+        fields["follow_up_after_days"] = follow_up_after_days
+    if archived is not None:
+        fields["archived"] = archived
 
     if not fields:
         console.print("[yellow]Nothing to update — pass at least one option.[/yellow]")
@@ -206,136 +278,152 @@ def edit(
             console.print(f"  {key} = {value}")
 
 
-def _classify_reply(session, reply, outreach) -> None:
-    """Classify a reply using Claude and persist the result. Logs result to console."""
-    from src.core.classifier import build_prompt
-    from src.integrations.claude_client import ClaudeClient
-
-    try:
-        claude = ClaudeClient()
-        prompt = build_prompt(
-            outreach_subject=outreach.subject,
-            outreach_body=outreach.body,
-            reply_body=reply.body,
-            recipient_name=outreach.recipient_name,
-            company=outreach.company,
-        )
-        result = claude.classify(prompt)
-        update_reply_classification(session, reply.id, result)
-        console.print(
-            f"    [cyan]Classified:[/cyan] {result.classification.value} "
-            f"({result.confidence:.0%}) — {result.reasoning}"
-        )
-    except Exception as e:
-        console.print(f"    [yellow]Classification failed:[/yellow] {e} (reply saved as unclassified)")
-
-
 @app.command()
 def sync() -> None:
-    """Poll Gmail for replies on all awaiting_reply outreaches."""
-    from src.core.matcher import find_matching_outreach
-    from src.core.reply_service import build_reply
+    """Sync Gmail threads: resolve unresolved outreaches, then fetch new messages."""
+    from src.core.message_service import build_message
+    from src.core.thread_diff import compute_new_message_ids, detect_direction
     from src.integrations.gmail_client import GmailClient
 
     creds_path = Path(settings.google_credentials_file)
     if not creds_path.exists():
-        console.print(
-            "[red]Not authenticated.[/red] Run [bold]outreach-track auth[/bold] first."
-        )
+        console.print("[red]Not authenticated.[/red] Run [bold]outreach-track auth[/bold] first.")
         raise typer.Exit(1)
 
     try:
         gmail = GmailClient()
+        auth_email = gmail.get_authenticated_email()
     except Exception as e:
         console.print(f"[red]Failed to connect to Gmail:[/red] {e}")
         raise typer.Exit(1)
 
+    console.print(f"Authenticated as: {auth_email}\n")
+
     with get_session() as session:
-        outreaches = get_awaiting_outreaches(session)
-        if not outreaches:
-            console.print("No outreaches awaiting reply.")
+        # Step 1: Resolve thread IDs for outreaches that don't have one yet
+        unresolved = get_unresolved_outreaches(session)
+        if unresolved:
+            console.print(f"Resolving {len(unresolved)} unresolved outreach(es)...")
+            for outreach in unresolved:
+                # Use the subject from the first outbound message
+                messages = get_messages_for_outreach(session, outreach.id)
+                first = next((m for m in messages if m.direction == Direction.outbound), None)
+                if not first:
+                    console.print(f"  [yellow]#{outreach.id}[/yellow] — no outbound message, skipping")
+                    continue
+
+                thread_id = gmail.search_sent_thread_id(
+                    to_email=outreach.recipient_email,
+                    subject=first.subject,
+                )
+                if not thread_id:
+                    console.print(
+                        f"  [yellow]#{outreach.id}[/yellow] — could not find Gmail thread "
+                        f"(to={outreach.recipient_email}, subject={first.subject!r}). Will retry on next sync."
+                    )
+                    continue
+
+                set_thread_id(session, outreach.id, thread_id)
+                console.print(f"  [green]#{outreach.id}[/green] — thread resolved: {thread_id}")
+
+        # Step 2: Sync messages for all active (resolved, non-archived) outreaches
+        active = get_active_outreaches(session)
+        if not active:
+            console.print("No active outreaches to sync.")
             return
 
-        console.print(f"Checking {len(outreaches)} outreach(es) for replies...")
-        found = 0
-        skipped = 0
+        console.print(f"\nSyncing {len(active)} active outreach(es)...")
+        total_new = 0
 
-
-        for outreach in outreaches:
+        for outreach in active:
             console.print(
-                f"  Checking #{outreach.id} — {outreach.recipient_email} "
-                f"(sent {_fmt(outreach.sent_at)})"
+                f"  #{outreach.id} — {outreach.recipient_email} "
+                f"(thread: {outreach.gmail_thread_id})"
             )
-            message_ids = gmail.list_message_ids_from(
-                sender_email=outreach.recipient_email,
-                after=outreach.sent_at,
-            )
-            console.print(f"    Found {len(message_ids)} message(s) from this sender")
+            thread_message_ids = gmail.get_thread_message_ids(outreach.gmail_thread_id)
+            local_ids = get_local_gmail_ids(session, outreach.id)
+            new_ids = compute_new_message_ids(thread_message_ids, local_ids)
 
-            for message_id in message_ids:
-                message = gmail.get_message(message_id)
-                from_email = gmail.get_from_email(message)
-                received_at = gmail.get_received_at(message)
-                console.print(f"    → from={from_email}  received={_fmt(received_at)}")
+            if not new_ids:
+                console.print("    No new messages.")
+                continue
 
-                if not from_email:
-                    console.print("      [dim]Skipped: no from header[/dim]")
-                    continue
+            console.print(f"    {len(new_ids)} new message(s) found")
 
-                match = find_matching_outreach(from_email, [outreach])
-                if not match:
-                    console.print(
-                        f"      [dim]Skipped: {from_email!r} did not match "
-                        f"{outreach.recipient_email!r}[/dim]"
-                    )
-                    continue
+            for message_id in new_ids:
+                raw = gmail.get_message(message_id)
+                from_email = gmail.get_from_email(raw)
+                direction_str = detect_direction(from_email or "", auth_email)
+                direction = Direction(direction_str)
+                subject = gmail.get_subject(raw)
+                body = gmail.decode_body(raw)
+                sent_at = gmail.get_sent_at(raw)
 
-                body = gmail.decode_body(message)
-                received_at = gmail.get_received_at(message)
+                msg_data = build_message(
+                    outreach_id=outreach.id,
+                    direction=direction,
+                    subject=subject,
+                    body=body,
+                    sent_at=sent_at,
+                    gmail_message_id=message_id,
+                )
+                message = save_message(session, msg_data)
+                total_new += 1
 
-                try:
-                    reply_data = build_reply(
-                        gmail_message_id=message_id,
-                        outreach_id=match.id,
-                        received_at=received_at,
-                        body=body,
-                    )
-                    reply = save_reply(session, reply_data)
-                    mark_outreach_replied(session, match.id)
-                    found += 1
-                    console.print(
-                        f"  [green]Reply found[/green] from {from_email} "
-                        f"(outreach #{match.id})"
-                    )
-                    _classify_reply(session, reply, match)
-                except Exception as e:
-                    # Unique constraint hit = already recorded; skip silently
-                    if "UNIQUE constraint failed" in str(e):
-                        skipped += 1
-                        session.rollback()
-                    else:
-                        raise
+                arrow = "→ outbound" if direction == Direction.outbound else "← inbound"
+                console.print(f"    [{arrow}] {subject[:60]} ({_fmt(sent_at)})")
 
-        console.print(
-            f"\n[bold]Done.[/bold] {found} new reply(s) recorded, {skipped} already known."
-        )
+                if direction == Direction.inbound:
+                    _classify_message(session, message, outreach)
+
+        console.print(f"\n[bold]Done.[/bold] {total_new} new message(s) recorded.")
 
 
 @app.command()
-def classify(reply_id: int = typer.Argument(..., help="Reply ID to classify")) -> None:
-    """Re-run Claude classification on an existing reply."""
+def classify(message_id: int = typer.Argument(..., help="Message ID to classify (inbound only)")) -> None:
+    """Re-run Claude classification on an existing inbound message."""
     with get_session() as session:
-        reply = get_reply_by_id(session, reply_id)
-        if not reply:
-            console.print(f"[red]No reply found with ID {reply_id}.[/red]")
+        message = get_message_by_id(session, message_id)
+        if not message:
+            console.print(f"[red]No message found with ID {message_id}.[/red]")
             raise typer.Exit(1)
 
-        outreach = get_outreach_by_id(session, reply.outreach_id)
+        if message.direction == Direction.outbound:
+            console.print("[red]Cannot classify an outbound message.[/red]")
+            raise typer.Exit(1)
+
+        outreach = get_outreach_by_id(session, message.outreach_id)
         if not outreach:
-            console.print(f"[red]Outreach record for reply #{reply_id} not found.[/red]")
+            console.print(f"[red]Outreach for message #{message_id} not found.[/red]")
             raise typer.Exit(1)
 
-        _classify_reply(session, reply, outreach)
+        _classify_message(session, message, outreach)
+
+
+@app.command(name="help")
+def help_cmd() -> None:
+    """List all available commands with descriptions."""
+    commands = [
+        ("add",      "Record a sent cold outreach email (creates outreach + first message)"),
+        ("list",     "List all outreach records with their derived status"),
+        ("show",     "Show full thread detail for a single outreach"),
+        ("edit",     "Edit fields on an existing outreach record"),
+        ("sync",     "Resolve Gmail threads and fetch new messages"),
+        ("classify", "Re-run Claude classification on an existing inbound message"),
+        ("auth",     "Authenticate with Gmail via OAuth (one-time setup)"),
+        ("help",     "List all available commands with descriptions"),
+    ]
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("Command", style="cyan", min_width=12)
+    table.add_column("Description")
+
+    for cmd_name, description in commands:
+        table.add_row(cmd_name, description)
+
+    console.print("\n[bold]outreach-track[/bold] — Cold Outreach Tracker\n")
+    console.print(table)
+    console.print("\nRun [cyan]outreach-track <command> --help[/cyan] for detailed options.\n")
 
 
 @app.command()

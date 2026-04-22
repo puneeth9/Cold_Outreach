@@ -1,16 +1,9 @@
-import enum
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
-
-
-class OutreachStatus(str, enum.Enum):
-    awaiting_reply = "awaiting_reply"
-    replied = "replied"
-    archived = "archived"
 
 
 class Outreach(Base):
@@ -18,17 +11,19 @@ class Outreach(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     recipient_email: Mapped[str] = mapped_column(String, nullable=False)
-    recipient_name: Mapped[str] = mapped_column(String, nullable=False)
+    recipient_name: Mapped[str | None] = mapped_column(String, nullable=True)
     company: Mapped[str | None] = mapped_column(String, nullable=True)
-    role_context: Mapped[str | None] = mapped_column(Text, nullable=True)
-    subject: Mapped[str] = mapped_column(String, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    sent_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    role: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Populated on first sync by searching Gmail sent mail for this outreach
+    gmail_thread_id: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
+    # Per-outreach override; falls back to FOLLOW_UP_AFTER_DAYS_DEFAULT from settings
+    follow_up_after_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Archived is the only stored status component; all other status is derived
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    status: Mapped[OutreachStatus] = mapped_column(
-        Enum(OutreachStatus, native_enum=False), nullable=False, default=OutreachStatus.awaiting_reply
-    )
 
-    replies: Mapped[list["Reply"]] = relationship("Reply", back_populates="outreach")  # noqa: F821
+    messages: Mapped[list["Message"]] = relationship(  # noqa: F821
+        "Message", back_populates="outreach", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (Index("ix_outreach_recipient_email", "recipient_email"),)

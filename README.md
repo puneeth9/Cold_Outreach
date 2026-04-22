@@ -7,9 +7,11 @@ A local CLI tool that tracks cold outreach emails you've sent, detects replies v
 ## How it works
 
 1. You send a cold email yourself (via Gmail or any email client)
-2. You log it with `outreach-track add`
-3. Run `outreach-track sync` periodically — it polls Gmail for replies and classifies them automatically
+2. You log it with `outreach-track add` — this records the outreach and its first outbound message
+3. Run `outreach-track sync` periodically — it resolves Gmail thread IDs, fetches all messages in each thread, classifies inbound replies with Claude, and stores the full conversation
 4. Use `outreach-track list` and `outreach-track show` to review your pipeline
+
+The tool tracks full email threads, not just individual replies. Every message in a thread (your outbounds and their inbounds) is stored and shown together.
 
 ---
 
@@ -46,12 +48,15 @@ Edit `.env`:
 
 ```env
 DATABASE_URL=sqlite:///./outreach.db
+FOLLOW_UP_AFTER_DAYS_DEFAULT=5
 
 GOOGLE_CLIENT_SECRET_FILE=./client_secret.json
 GOOGLE_CREDENTIALS_FILE=./token.json
 
 ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+`FOLLOW_UP_AFTER_DAYS_DEFAULT` controls how many days after your last outbound message the status changes from `awaiting_reply` to `follow_up_needed`. Default is 5. Can be overridden per outreach with `--follow-up-after-days`.
 
 ---
 
@@ -100,13 +105,10 @@ outreach-track add \
   --to recruiter@company.com \
   --name "Jane Smith" \
   --company "Acme Corp" \
-  --subject "Software Engineer role" \
-  --sent-at "2026-04-21T10:30:00"
+  --subject "Software Engineer role"
 ```
 
-If you omit `--body-file`, you'll be prompted to paste the email body interactively — type your text and enter `EOF` on a new line to finish.
-
-To read the body from a file:
+You'll be prompted to paste the email body interactively — type your text and enter `EOF` on a new line to finish. To read the body from a file instead:
 
 ```bash
 outreach-track add \
@@ -116,7 +118,12 @@ outreach-track add \
   --body-file ./email.txt
 ```
 
-`--sent-at` defaults to the current time if omitted.
+Optional flags:
+- `--sent-at "2026-04-21T10:30:00"` — defaults to the current time if omitted
+- `--follow-up-after-days 7` — overrides `FOLLOW_UP_AFTER_DAYS_DEFAULT` for this outreach only
+- `--role "Engineering Lead"` — context for the classifier
+
+The `add` command logs the outreach and records your initial email as the first outbound message in the thread. It does **not** send the email — you send from Gmail yourself.
 
 ---
 
@@ -126,12 +133,13 @@ outreach-track add \
 outreach-track sync
 ```
 
-For each outreach with status `awaiting_reply`, this polls Gmail for messages from that recipient and:
-- Records any replies found
-- Classifies each reply using Claude
-- Updates the outreach status to `replied`
+`sync` runs in two passes:
 
-Run this whenever you want to check for new replies. Duplicate replies are handled automatically via Gmail message ID deduplication.
+1. **Resolve unresolved outreaches** — for any outreach without a Gmail thread ID, searches your sent mail for a message matching the recipient email and subject line. Stores the thread ID on success.
+
+2. **Sync active threads** — for each outreach with a thread ID, fetches all messages in the thread, determines which are new (not yet stored locally), classifies each inbound message with Claude, and stores the full conversation.
+
+Run this whenever you want to check for new replies. Duplicate messages are skipped automatically via Gmail message ID deduplication.
 
 ---
 
@@ -141,58 +149,106 @@ Run this whenever you want to check for new replies. Duplicate replies are handl
 outreach-track list
 ```
 
-Filter by status:
-
-```bash
-outreach-track list --status awaiting_reply
-outreach-track list --status replied
-outreach-track list --status archived
-```
+Displays a table with ID, recipient, company, status, and last activity date. Status is computed live from the thread — it is never stored in the database.
 
 ---
 
-### View a single outreach and its replies
+### View a full thread
 
 ```bash
 outreach-track show <id>
 ```
 
-Shows the full outreach detail, body, and a table of all replies with their classification, confidence score, and reasoning.
+Shows the full outreach detail and every message in the thread in chronological order:
+
+```
+→ [outbound]  Subject: Software Engineer role
+  Hi Jane, I wanted to reach out...
+
+← [inbound]   Subject: Re: Software Engineer role
+  Classification: interested (0.92) — Recipient expressed clear interest and asked to schedule a call
+  Thanks for reaching out! I'd love to chat...
+```
 
 ---
 
 ### Edit an outreach record
 
 ```bash
-outreach-track edit <id> --to corrected@email.com
-outreach-track edit <id> --status archived
-outreach-track edit <id> --name "Jane Doe" --company "New Corp"
+outreach-track edit <id> --follow-up-after-days 7
+outreach-track edit <id> --archived
 ```
 
-Any combination of fields can be updated. Supported options: `--to`, `--name`, `--subject`, `--company`, `--role`, `--status`, `--sent-at`.
+Supported options: `--to`, `--name`, `--company`, `--role`, `--follow-up-after-days`, `--archived`.
 
 ---
 
-### Re-classify a reply
+### Re-classify a message
 
 ```bash
-outreach-track classify <reply_id>
+outreach-track classify <message_id>
 ```
 
-Re-runs Claude classification on an existing reply. Useful if a reply was recorded before the classifier was set up, or if you want to re-evaluate with an updated prompt.
-
-Reply IDs are shown in the `outreach-track show` output.
+Re-runs Claude classification on an existing inbound message. Message IDs are shown in the `outreach-track show` output. Only inbound messages can be classified — running this on an outbound message is an error.
 
 ---
 
-## Reply Classifications
+### List all commands
 
-| Classification | Meaning |
+```bash
+outreach-track help
+```
+
+---
+
+## Thread Status
+
+Status is derived from the thread state at query time — it is never stored in the database.
+
+| Status | Meaning |
 |---|---|
-| `interested` | Recipient wants to continue the conversation or take action |
-| `not_interested` | Recipient declined or is not open to further contact |
-| `needs_followup` | Reply is ambiguous, asks a question, or requires a response |
-| `unclassified` | Out-of-office, auto-reply, or no actionable signal |
+| `draft` | Outreach logged but no messages recorded yet |
+| `awaiting_reply` | Last message is outbound; follow-up threshold not yet reached |
+| `follow_up_needed` | Last message is outbound; follow-up threshold has passed |
+| `interested` | Last inbound message classified as interested |
+| `not_interested` | Last inbound message classified as not interested |
+| `needs_followup` | Last inbound reply is ambiguous or asks a question |
+| `unclassified` | Last inbound message has not been classified (out-of-office, auto-reply, etc.) |
+| `archived` | Outreach has been manually archived |
+
+---
+
+## Data Model
+
+**`outreach`** — one row per cold outreach contact.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | int | Primary key |
+| `recipient_email` | str | Normalised to lowercase |
+| `recipient_name` | str? | Optional display name |
+| `company` | str? | Optional company context |
+| `role` | str? | Optional role context |
+| `gmail_thread_id` | str? | Resolved on first `sync`; null until then |
+| `follow_up_after_days` | int? | Per-outreach override; falls back to global default |
+| `archived` | bool | Set by `edit --archived` |
+| `created_at` | datetime | |
+
+**`messages`** — one row per message in the thread.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | int | Primary key |
+| `outreach_id` | int | Foreign key to `outreach` |
+| `direction` | enum | `outbound` or `inbound` |
+| `gmail_message_id` | str? | Unique; used for deduplication |
+| `subject` | str | |
+| `body` | str | Full decoded text |
+| `sent_at` | datetime | From Gmail `internalDate` |
+| `classification` | enum? | `interested`, `not_interested`, `needs_followup`, `unclassified` |
+| `classification_confidence` | float? | 0.0–1.0 |
+| `classification_reasoning` | str? | One sentence from Claude |
+| `created_at` | datetime | |
 
 ---
 
@@ -202,7 +258,7 @@ Reply IDs are shown in the `outreach-track show` output.
 pytest
 ```
 
-Tests cover pure business logic (no API calls). Gmail and Claude are mocked at the integration boundary.
+Tests cover all pure business logic. Gmail and Claude are mocked at the integration boundary.
 
 ---
 
@@ -210,24 +266,25 @@ Tests cover pure business logic (no API calls). Gmail and Claude are mocked at t
 
 ```
 src/
-├── config.py           # Pydantic settings — reads from .env
-├── core/               # Pure business logic — no I/O
+├── config.py               # Pydantic settings — reads from .env
+├── core/                   # Pure business logic — no I/O
 │   ├── outreach_service.py
-│   ├── matcher.py
-│   ├── reply_service.py
+│   ├── message_service.py
+│   ├── thread_diff.py
+│   ├── status.py
 │   └── classifier.py
-├── integrations/       # All external I/O
+├── integrations/           # All external I/O
 │   ├── gmail_client.py
 │   └── claude_client.py
-├── db/                 # SQLAlchemy session + repository functions
+├── db/                     # SQLAlchemy session + repository functions
 │   ├── session.py
 │   ├── outreach_repo.py
-│   └── reply_repo.py
-├── models/             # SQLAlchemy ORM models
+│   └── message_repo.py
+├── models/                 # SQLAlchemy ORM models
 │   ├── outreach.py
-│   └── reply.py
+│   └── message.py
 └── cli/
-    └── main.py         # Typer CLI entry point
+    └── main.py             # Typer CLI entry point
 ```
 
 ---
