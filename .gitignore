@@ -1,5 +1,6 @@
 .env
 credentials.json
+client_secret.json
 token.json
 credentials/
 __pycache__/
