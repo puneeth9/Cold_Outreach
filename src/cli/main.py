@@ -134,15 +134,16 @@ def add(
         save_message(session, msg_data)
         console.print(
             f"[green]Added outreach #{outreach.id}[/green] to {outreach_data.recipient_email}\n"
-            f"  Run [bold]outreach-track sync[/bold] to resolve the Gmail thread."
+            f"  Run [bold]outreach-track list[/bold] to sync and see updated status."
         )
 
 
 @app.command(name="list")
 def list_cmd(
     status: Optional[str] = typer.Option(None, "--status", help="Filter by status"),
+    no_sync: bool = typer.Option(False, "--no-sync", help="Skip Gmail sync before listing"),
 ) -> None:
-    """List outreach records with their derived status."""
+    """Sync Gmail then list outreach records with their derived status."""
     valid_statuses = {
         "awaiting_reply", "follow_up_needed", "interested",
         "not_interested", "needs_followup", "unclassified", "archived", "draft",
@@ -150,6 +151,9 @@ def list_cmd(
     if status and status not in valid_statuses:
         console.print(f"[red]Invalid status.[/red] Choose from: {', '.join(sorted(valid_statuses))}")
         raise typer.Exit(1)
+
+    if not no_sync:
+        _run_sync()
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", justify="right", width=5)
@@ -159,8 +163,6 @@ def list_cmd(
     table.add_column("Thread ID", min_width=12)
     table.add_column("Created", min_width=18)
 
-    # Status is computed in-memory after fetch (fine for local scale;
-    # future optimization: push status computation to SQL for large datasets)
     with get_session() as session:
         outreaches = list_outreaches(session)
         if not outreaches:
@@ -278,8 +280,7 @@ def edit(
             console.print(f"  {key} = {value}")
 
 
-@app.command()
-def sync() -> None:
+def _run_sync() -> None:
     """Sync Gmail threads: resolve unresolved outreaches, then fetch new messages."""
     from src.core.message_service import build_message
     from src.core.thread_diff import compute_new_message_ids, detect_direction
@@ -376,7 +377,13 @@ def sync() -> None:
                 if direction == Direction.inbound:
                     _classify_message(session, message, outreach)
 
-        console.print(f"\n[bold]Done.[/bold] {total_new} new message(s) recorded.")
+        console.print(f"\n[bold]Done.[/bold] {total_new} new message(s) recorded.\n")
+
+
+@app.command()
+def sync() -> None:
+    """Sync Gmail threads: resolve unresolved outreaches, then fetch new messages."""
+    _run_sync()
 
 
 @app.command()
@@ -405,7 +412,7 @@ def help_cmd() -> None:
     """List all available commands with descriptions."""
     commands = [
         ("add",      "Record a sent cold outreach email (creates outreach + first message)"),
-        ("list",     "List all outreach records with their derived status"),
+        ("list",     "Sync Gmail then list outreach records (use --no-sync to skip sync)"),
         ("show",     "Show full thread detail for a single outreach"),
         ("edit",     "Edit fields on an existing outreach record"),
         ("sync",     "Resolve Gmail threads and fetch new messages"),
